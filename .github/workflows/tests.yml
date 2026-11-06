@@ -1,0 +1,28 @@
+name: Windows and Linux checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.9', '3.12']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Linux GUI prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk python3-venv xvfb xauth
+      - name: Bootstrap the project venv
+        run: python start.py --check-env
+      - name: Windows tests
+        if: runner.os == 'Windows'
+        run: .venv/Scripts/python.exe -m unittest discover -s tests -v
+      - name: Linux tests (Tk under Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a .venv-linux/bin/python -m unittest discover -s tests -v

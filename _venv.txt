@@ -1,0 +1,17 @@
+# Automatikus venv-indítás
+Windows: start.bat vagy py -3 start.py
+Linux:   sh start.sh vagy python3 start.py
+Demó:    --demo
+Környezet ellenőrzése: --check-env
+
+Nem kell kézi aktiválás vagy PowerShell execution-policy módosítás.
+Windows: .venv/Scripts/python.exe
+Linux:   .venv-linux/bin/python
+
+Linux rendszerfüggőségek (egyszer, kézzel):
+  Debian/Ubuntu: sudo apt install python3-tk python3-venv
+  Fedora:        sudo dnf install python3-tkinter
+
+Részletes leírás: README.md
+
+
