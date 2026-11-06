@@ -17,7 +17,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Linux GUI prerequisites
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y python3-tk python3-venv xvfb xauth
+        run: sudo apt-get update && sudo apt-get install -y python3-tk python3-venv xvfb xauth g++
       - name: Bootstrap the project venv
         run: python start.py --check-env
       - name: Windows tests
@@ -26,3 +26,19 @@ jobs:
       - name: Linux tests (Tk under Xvfb)
         if: runner.os == 'Linux'
         run: xvfb-run -a .venv-linux/bin/python -m unittest discover -s tests -v
+  nano-firmware:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        cpu: [atmega328, atmega328old]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+        with:
+          version: '1.5.1'
+      - name: Install pinned AVR core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr@1.8.6
+      - name: Compile Nano application and combined bootloader image
+        run: arduino-cli compile --fqbn arduino:avr:nano:cpu=${{ matrix.cpu }} --export-binaries --output-dir firmware/build/${{ matrix.cpu }} firmware/AS7265xController

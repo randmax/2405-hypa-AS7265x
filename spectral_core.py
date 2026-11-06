@@ -12,6 +12,7 @@ import time
 
 import numpy as np
 import serial
+from device_protocol import DeviceProtocol, parse_message
 
 WAVELENGTHS = (410, 435, 460, 485, 510, 535, 560, 585, 610,
                645, 680, 705, 730, 760, 810, 860, 900, 940)
@@ -65,6 +66,12 @@ class SpectrumBuffer:
             while len(self.samples) > capacity:
                 self.total -= self.samples.popleft()
 
+    def clear(self):
+        with self._lock:
+            self.samples.clear()
+            self.total.fill(0)
+            self.received_at = 0.0
+
     def append(self, values):
         with self._lock:
             if len(self.samples) == self.capacity:
@@ -117,6 +124,32 @@ class Acquisition(threading.Thread):
         self.buffer = buffer if buffer is not None else SpectrumBuffer()
         self.suppressed_messages = 0
         self.stop_event = threading.Event()
+        self.protocol = DeviceProtocol()
+
+    def command(self, op, *args):
+        return self.protocol.request(op, *args)
+
+    def _device_message(self, message):
+        previous = self.protocol.state
+        if message["type"] == "state" and previous and any(
+                previous[key] != message[key] for key in ("gain", "cycles", "format")):
+            self.buffer.clear()  # Never average/export mixed gain or data formats.
+        acknowledged = self.protocol.accept(message)
+        self.emit("device", dict(message, acknowledged=acknowledged))
+
+    def _commands(self, connection, now):
+        for notice in self.protocol.take_cancelled():
+            self.emit("device", notice)
+        for _ in range(4):
+            item = self.protocol.next_command(now)
+            if item is None:
+                break
+            written = connection.write(item.wire)
+            if written != len(item.wire):
+                raise serial.SerialTimeoutException("A panelparancs csak részben lett elküldve.")
+        for timeout in self.protocol.expire(now):
+            if timeout["command"] != "INFO":
+                self.emit("device", timeout)
 
     def emit(self, kind, payload):
         # Diagnostics must never stop measurement or fill the OS serial buffer.
@@ -141,21 +174,71 @@ class Acquisition(threading.Thread):
         try:
             if self.demo:
                 self.emit("ready", "DEMÓ · szimulált adatok")
+                self._device_message({"type": "hello", "id": 0, "protocol": 1,
+                                      "device": "AS7265x", "firmware": "demo-1.0", "board": "Szimulátor",
+                                      "sensor_ok": 1, "caps": ["LED", "IND", "SET", "TEMP", "RUN", "SHOT", "OFF", "PING"]})
+                state = {"type": "state", "id": 0, "gain": 2, "cycles": 10,
+                         "format": "calibrated", "stream": 1, "led": [0, 0, 0], "current": [0, 0, 0],
+                         "indicator": [0, 0, 0], "indicator_current": [0, 0, 0]}
+                self._device_message(dict(state))
                 step = 0
                 x = np.arange(18)
+                next_sample = 0.0
+                single_shot = False
                 while not self.stop_event.is_set():
-                    values = 120 + 650 * np.exp(-((x - (8 + 4 * np.sin(step / 24))) / 3.8) ** 2)
-                    values += 35 * np.sin(x + step / 7)
-                    self.buffer.append(values)
-                    step += 1
-                    self.stop_event.wait(0.1)
+                    now = time.monotonic()
+                    for notice in self.protocol.take_cancelled():
+                        self.emit("device", notice)
+                    item = self.protocol.next_command(now)
+                    if item:
+                        tokens = item.wire.decode("ascii").split()
+                        op, args = tokens[1], tokens[2:]
+                        state = dict(state, id=item.id)
+                        if op in {"LED", "IND"}:
+                            enabled, current = ("led", "current") if op == "LED" else ("indicator", "indicator_current")
+                            state[enabled] = list(state[enabled]); state[current] = list(state[current])
+                            state[enabled][int(args[0])] = int(args[1]); state[current][int(args[0])] = int(args[2])
+                        elif op == "OFF":
+                            state["led"] = [0, 0, 0]; state["indicator"] = [0, 0, 0]
+                        elif op == "SET":
+                            state.update(gain=int(args[0]), cycles=int(args[1]), format=args[2])
+                        elif op == "RUN":
+                            state["stream"] = int(args[0])
+                        elif op == "SHOT":
+                            single_shot = True
+                        if op == "INFO":
+                            self._device_message(dict(self.protocol.hello, id=item.id))
+                        elif op == "TEMP":
+                            self._device_message({"type": "temperature", "id": item.id, "values": [25, 26, 25]})
+                        else:
+                            self._device_message(dict(state))
+                    if (state["stream"] or single_shot) and now >= next_sample:
+                        values = 120 + 650 * np.exp(-((x - (8 + 4 * np.sin(step / 24))) / 3.8) ** 2)
+                        values += 35 * np.sin(x + step / 7)
+                        if state["format"] == "raw":
+                            values = np.clip(values * 10, 0, 65535).astype(int).astype(float)
+                        self.buffer.append(values)
+                        step += 1; single_shot = False
+                        next_sample = now + max(0.02, state["cycles"] * 0.0056)
+                    self.stop_event.wait(0.01)
                 return
             with serial.serial_for_url(self.port, baudrate=self.baud, timeout=0.05,
                                        write_timeout=0.2) as connection:
                 self.emit("ready", "{} · {} baud".format(self.port, self.baud))
+                next_probe = time.monotonic()
+                probes = 0
+                last_ping = 0.0
                 pending = bytearray()
                 discarding = False
                 while not self.stop_event.is_set():
+                    now = time.monotonic()
+                    if not self.protocol.hello and probes < 3 and now >= next_probe and hasattr(connection, "write"):
+                        self.protocol.request("INFO")
+                        probes += 1; next_probe = now + 1.5
+                    if self.protocol.available and now - last_ping >= 2 and "PING" in self.protocol.hello["caps"]:
+                        connection.write(b"@0 PING\n")
+                        last_ping = now
+                    self._commands(connection, now)
                     block = connection.read(min(max(connection.in_waiting, 1), 65536))
                     fragments = block.split(b"\n")
                     for index, fragment in enumerate(fragments):
@@ -172,12 +255,19 @@ class Acquisition(threading.Thread):
                             continue  # Last fragment may be an unfinished serial line.
                         if not discarding and pending:
                             line = pending.decode("utf-8", errors="replace").strip()
-                            values = parse_sample(line)
-                            if values is not None:
+                            message = parse_message(line)
+                            values = None if message else parse_sample(line)
+                            if message:
+                                self._device_message(message)
+                            elif values is not None:
                                 self.buffer.append(values)
                             else:
                                 self.emit("message", line[:240])
                         pending.clear()
                         discarding = False
+                if self.protocol.available:
+                    # Best effort on close; the firmware also times out illumination
+                    # after missing host heartbeats. Do not wait for a reply here.
+                    connection.write(b"@0 OFF\n")
         except (serial.SerialException, OSError, ValueError) as exc:
             self.emit("error", str(exc))

@@ -1,0 +1,13 @@
+{
+  "profile": "nano-old",
+  "fqbn": "arduino:avr:nano:cpu=atmega328old",
+  "core": "arduino:avr@1.8.6",
+  "source_sha256": {
+    "AS7265xController.ino": "04c3add12366f528b6d7862cd721f08660c5e53d6de21fac5c09151b0bd907f7",
+    "FastAS7265x.h": "2400ec25f8fb7e68babf1a484ab03b1569f06b5f7432e6cf2ac7253da3bc9c8a"
+  },
+  "files": {
+    "AS7265xController.ino.hex": "eeeb4b62f8461b647c3b8a82962b24d46c9f129e6798e79014965eb38d2df2af",
+    "AS7265xController.ino.with_bootloader.hex": "93433657c729212a3222cca65808c42e68b42b9eb8b8f53fc1e5905900882243"
+  }
+}

@@ -1,10 +1,12 @@
 """Run with the project venv; Linux CI uses xvfb-run for a real Tk event loop."""
 import time
+import io
 import tkinter as tk
 import unittest
 from unittest.mock import patch
 
 import numpy as np
+from PIL import Image
 from mySpectRead02 import SpectralReader
 
 
@@ -130,6 +132,98 @@ class GuiTests(unittest.TestCase):
         self.assertAlmostEqual(self.app.figure.bbox.width, widget.winfo_width(), delta=1)
         self.assertAlmostEqual(self.app.figure.bbox.height, widget.winfo_height(), delta=1)
         self.assertGreater(self.app.theme.scale, 1.4)
+
+    def test_live_histogram_blits_bars_without_redrawing_static_axes(self):
+        self.app.autoscale_var.set(False)
+        self.app.ax.set_ylim(0, 100)
+        self.app.buffer.append(np.full(18, 20.0))
+        self.app.update_plot()
+        self.root.update()
+        full_draws = []
+        connection = self.app.canvas.mpl_connect("draw_event", lambda event: full_draws.append(1))
+        presented = self.app.presented_frames
+        self.app.buffer.append(np.full(18, 30.0))
+        self.app.update_plot()
+        self.app.canvas.mpl_disconnect(connection)
+        self.assertEqual(full_draws, [])
+        self.assertEqual(self.app.presented_frames, presented + 1)
+        np.testing.assert_array_equal([bar.get_height() for bar in self.app.bars], 30)
+        self.app.ax.set_ylim(0, 200)
+        self.app.update_plot()
+        self.root.update()
+        self.assertEqual(self.app.ax.get_ylim(), (0, 200))
+
+    def test_animated_histogram_bars_remain_visible_in_saved_png(self):
+        self.app.buffer.append(np.full(18, 50.0))
+        self.app.update_plot()
+        self.root.update()
+        png = io.BytesIO()
+        self.app.figure.savefig(png, format="png")
+        pixels = np.asarray(Image.open(png).convert("RGB"))
+        accent = self.app.theme.colors["accent"]
+        color = np.array([int(accent[i:i+2], 16) for i in (1, 3, 5)])
+        self.assertGreater(np.count_nonzero(np.all(pixels == color, axis=2)), 100)
+
+    def test_demo_board_commands_are_acknowledged_and_single_shot_works(self):
+        self.app.demo_var.set(True)
+        self.app.start_measurement()
+        self.pump(0.3)
+        self.assertTrue(self.app.device_available)
+        self.app.led_vars[1].set(True)
+        self.app._send_led(1)
+        self.assertTrue(self.app.pending_device)
+        self.pump(0.15)
+        self.assertFalse(self.app.pending_device)
+        self.assertEqual(self.app.device_state["led"], [0, 1, 0])
+        self.app._send_device("OFF")
+        self.pump(0.15)
+        self.assertEqual(self.app.device_state["led"], [0, 0, 0])
+        self.app._send_device("RUN", 0)
+        self.pump(0.15)
+        received = self.app.buffer.received
+        self.pump(0.15)
+        self.assertEqual(self.app.buffer.received, received)
+        self.app._send_device("SHOT")
+        self.pump(0.2)
+        self.assertEqual(self.app.buffer.received, received + 1)
+        self.app.sensor_format_var.set("Nyers")
+        self.app._apply_sensor()
+        self.pump(0.15)
+        self.assertEqual(self.app.device_state["format"], "raw")
+        self.assertEqual(len(self.app.buffer), 0)
+        self.app._send_device("SHOT")
+        self.pump(0.2)
+        self.assertEqual(len(self.app.buffer), 1)
+        values = self.app.buffer.snapshot().values
+        np.testing.assert_array_equal(values, values.astype(int))
+
+    def test_legacy_connection_leaves_board_controls_disabled(self):
+        self.assertFalse(self.app.device_available)
+        self.assertEqual(str(self.app.off_btn.cget("state")), "disabled")
+        self.assertEqual(str(self.app.gain_combo.cget("state")), "disabled")
+
+    def test_failed_command_restores_last_confirmed_led_state(self):
+        from test_protocol import STATE
+        self.app.device_state = dict(STATE)
+        self.app.pending_device[3] = "LED"
+        self.app.led_vars[0].set(True)
+        self.app._device_event({"type": "error", "id": 3, "message": "i2c_led_failed"})
+        self.assertFalse(self.app.led_vars[0].get())
+        self.assertFalse(self.app.pending_device)
+        self.assertIn("Panelhiba", self.app.device_info_var.get())
+
+    def test_off_cancels_unsent_led_command_without_leaving_ui_busy(self):
+        self.app.demo_var.set(True)
+        self.app.start_measurement()
+        self.pump(0.25)
+        with self.app.worker.protocol.lock:
+            self.app.led_vars[0].set(True)
+            self.app._send_led(0)
+            self.app._send_device("OFF")
+        self.pump(0.2)
+        self.assertFalse(self.app.pending_device)
+        self.assertFalse(self.app.led_vars[0].get())
+        self.assertEqual(str(self.app.gain_combo.cget("state")), "readonly")
 
     def test_manual_view_is_restored_per_mode(self):
         self.app.autoscale_var.set(False)

@@ -50,13 +50,30 @@ Linuxon a porthoz a felhasználónak hozzáférési jog kell. Debian/Ubuntu rend
 
 A `test01.py PORT BAUD` egy egyszerű, szintén automatikus venv-indítású konzolos soros monitor.
 
+## Arduino Nano firmware és panelvezérlés
+
+Az új Arduino program: [firmware/AS7265xController](firmware/AS7265xController). Klasszikus **Nano / ATmega328P**, **SDA=A4, SCL=A5** bekötéshez készült. A teljes bekötési, build-, bootloader- és UART-feltöltési leírás: [firmware/README.md](firmware/README.md).
+
+Az új firmware feltöltése és kapcsolódás után a **Nano / szenzor vezérlése** szekcióban elérhető:
+
+- a fehér, IR és UV megvilágító LED külön kapcsolása és 12,5–100 mA közötti árambeállítása;
+- mindhárom chip jelző LED-je és annak 1–8 mA-es árambeállítása, ha a panelen ki van építve;
+- 1× / 3,7× / 16× / 64× erősítés és 1–256 integrációs ciklus/bank;
+- nyers ADC vagy kalibrált adatok, automatikus pufferürítéssel formátum-/expozícióváltáskor;
+- az adatküldés szüneteltetése/folytatása nyitott port mellett, külön egyszeri mérés, három hőmérséklet.
+
+A panelparancsok visszaigazolást kapnak. Hibánál a GUI az utolsó visszaigazolt beállítást állítja vissza; a „Minden LED kikapcsolása” elsőbbséget kap a még el nem küldött LED-parancsokkal szemben. A demó a panelvezérlést is szimulálja. A régi CSV-only Arduino program változatlanul olvasható, de a vezérlőelemek azon letiltva maradnak.
+
+A `firmware/releases/nano` és `nano-old` mappában lefordított alkalmazás- és bootloaderes HEX-ek, SHA-256 manifestek találhatók. Normál UART-frissítéshez a meglévő Nano bootloadert és az alkalmazás HEX-et használjuk. A bootloadert tartalmazó egyesített HEX első helyreállításhoz / ISP-programozáshoz való; a bootloader telepítése és a későbbi UART-os programfrissítés külön művelet. Ez az Arduino programjára vonatkozik, az AS7265x gyári firmware-ét nem cseréli.
+
 ## Felület és teljesítmény
 
 - A **Téma → Világos / Fekete** választás a teljes saját felületet és a diagramot frissíti. A natív fájlválasztó és az ablak címsora az operációs rendszer témáját követheti.
 - Az oldalsáv szekciói összecsukhatók; a diagram és a napló közötti elválasztó húzható. Kis ablakban az oldalsáv görgethető.
 - A számmező és a legördülő csak tényleges kattintás és megtartott fókusz után módosítható görgővel; egyébként az oldalsáv gördül.
 - A diagram eszköztárával nagyíthatsz és eltolhatsz. Kézi navigáció után kikapcsol az automatikus skálázás. A **Nézet alaphelyzetbe** visszakapcsolja.
-- A soros olvasó külön szálon fut, 0,05 s olvasási időtúllépéssel. A teljes minták közvetlenül a szálbiztos, korlátozott előzménypufferbe kerülnek; a GUI annak friss pillanatképét rajzolja, legfeljebb 20 Hz gyakorisággal. A tényleges rajzolás befejezése is beleszámít az ütemezésbe. Egy megakasztott GUI vagy nyitott fájlablak után nem kell régi mérési eseményeket végigjátszani.
+- A soros olvasó külön szálon fut, 0,05 s olvasási időtúllépéssel. A teljes minták közvetlenül a szálbiztos, korlátozott előzménypufferbe kerülnek; a GUI annak friss pillanatképét rajzolja, legfeljebb 30 Hz gyakorisággal. A hisztogram a változatlan tengelyek és feliratok helyett csak az oszlopokat festi újra (blitting). A tengelyek kerekített határokat és visszaállítási késleltetést használnak, így a kis ingadozások nem okoznak folytonos teljes újrarajzolást. Téma-, méret-, zoom- és mértékegységváltáskor a háttér újraépül.
+- A rajzolás összevonása nem simítja vagy interpolálja a mérési értékeket: a megjelenített oszlopok a legfrissebb teljes spektrumot, illetve a külön beállított átlagot mutatják. A valódi új spektrumok gyakoriságát a Nano kiolvasási sebessége és a szenzor integrációja is korlátozza. Az új firmware 400 kHz I²C-t, rövid regiszter-pollingot és konverzió közben is működő parancsfogadást használ.
 - A kapcsolati üzeneteknek külön, 64 elemű sora van. Túl sok diagnosztikai sor esetén ezek összevonódnak; a napló telítődése nem állítja meg az érvényes mérések fogadását. A rajzolás köztes képkockákat kihagyhat, az eredeti méréseket a beállított pufferhatárig őrzi.
 - A napló legfeljebb 2000 sort őriz. A nagy adatsebesség nem jelent korlátlan veszteségmentes rögzítést: a soros eszköz és az operációs rendszer bemeneti puffere is véges. Tartós, teljes mérési archívumhoz külön folyamatos fájlírás szükséges.
 

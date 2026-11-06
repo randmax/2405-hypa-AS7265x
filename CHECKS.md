@@ -4,9 +4,9 @@
 
 | Környezet | Eredmény |
 |---|---|
-| Windows, Python 3.12.10, Matplotlib 3.10.1, NumPy 2.2.5 | 21 teszt: 20 sikeres, 1 Linux-specifikus PTY teszt kihagyva |
-| Windows, Python 3.9.13, Matplotlib 3.9.4, NumPy 2.0.2 | 21 teszt: 20 sikeres, 1 Linux-specifikus PTY teszt kihagyva |
-| Ubuntu 22.04 / WSL, Python 3.10.12, Matplotlib 3.10.9, NumPy 2.2.6, Tk / Xvfb | Mind a 21 teszt sikeres, a pyserial Linux PTY adatfogadással együtt |
+| Windows, Python 3.12.10, Matplotlib 3.10.1, NumPy 2.2.5 | 35 teszt: 33 sikeres, Linux PTY és g++ harness kihagyva |
+| Windows, Python 3.9.13, Matplotlib 3.9.4, NumPy 2.0.2 | 35 teszt: 33 sikeres, Linux PTY és g++ harness kihagyva |
+| Ubuntu 22.04 / WSL, Python 3.10.12, Matplotlib 3.10.9, NumPy 2.2.6, Tk / Xvfb | Mind a 35 teszt sikeres, valódi pyserial PTY és natív firmware harness mellett |
 
 Ellenőrzött viselkedés: 18 csatornás parser, záró vessző, NaN/Inf és hibás sorok elutasítása, darabolt sorok összefűzése, túl hosszú sor utáni helyreállás, gördülő átlag, pufferkorlát és sorrend, eredeti adatok CSV-exportja, megszakítás telt eseménysor mellett, portlezárás, ismételt indítás/leállítás, leállítás utáni menthetőség, újrahasznált diagramobjektumok, waterfall időiránya, témaváltás állapotmegőrzéssel, nézetenként megőrzött tengelyhatárok, kattintáshoz kötött görgőkezelés, korlátozott napló, hosszú státuszszöveg, 150%-os skálázásnál a bitmap és a vászon méretének egyezése, témázott buboréksúgó és erőforrás-felszabadítása.
 
@@ -33,6 +33,28 @@ Szintetikus terhelésmérés Ubuntu/WSL és Xvfb alatt, 150%-os Tk-skálázássa
 
 Az idő a szintetikus sor elküldésétől a Matplotlib `draw_event` eseményéig értendő. Ez szoftveres terhelésmérés, nem az érzékelő mérésétől a monitor fizikai frissüléséig tartó hardveres késleltetés mérése. A fogadás a GUI-szünet alatt is folytatódott; nem keletkezett visszajátszandó mérési eseménysor.
 
+## Nano firmware, bootloader és panelvezérlés
+
+- A megadott adatlap teljes regiszter- és I²C-fejezete alapján készült önálló virtuálisregiszter-driver. Az integráció és a LED-regiszter táblázata vizuálisan is ellenőrizve; a kapott fájl belső verziója DS000612 v1-04.
+- Arduino CLI 1.5.1 és Arduino AVR Boards 1.8.6 mellett sikeres a Nano (`atmega328`) és Nano Old Bootloader (`atmega328old`) fordítása: **11752 bájt flash**, **614 bájt statikus RAM**, mindkét profilon. Sem UART-os feltöltés, sem ISP-programozás nem történt fizikai eszközre.
+- Mindkét profilhoz létrejött az alkalmazás HEX és az alkalmazás+bootloader HEX. A tesztek ellenőrzik a SHA-256 manifestet, a forrásegyezést, minden Intel HEX sor ellenőrzőösszegét és a bootloader flash-címtartományának jelenlétét.
+- A tényleges `.ino` és I²C-driver natív g++ környezetben, virtuális Wire/Serial eszközzel fut. Ellenőrzött: hat LED vezérlőbitjei és áramkódjai, integrációs regiszter ciklus−1 leképezése, erősítés/nyers mód, 18 csatorna sorrendje, big-endian float/uint16 kiolvasás, hibás parancsok és I²C-hiba elutasítása, negatív hőmérséklet, egyszeri mérés, életjel utáni automatikus LED-kikapcsolás, túl hosszú sor utáni helyreállás. Az így kiírt JSON/CSV sorokat a PC saját parsere is ellenőrzi.
+- A GUI-tesztek lefedik a demó parancsvisszaigazolásait, a prioritásos „minden LED ki” műveletet, a törölt parancs utáni UI-feloldást, hiba esetén az utolsó igazolt állapot visszaállítását, a szünet/egyszeri mérést, a nyers módra váltáskor ürített puffert és a régi CSV-firmware letiltott vezérlőit.
+- A Nano kezelőszekció világos és fekete témában, 150%-os Tk-skálázással képen is ellenőrizve, a görgetés felső és alsó részén is.
+
+## Folyamatosabb hisztogram – részleges újrarajzolás
+
+A hisztogram animált oszlopait külön rajzoljuk a gyorsítótárazott háttérre; a tengelyek, szövegek és rács csak szükség esetén épülnek újra. Az automatikus skála kerekített határokra vált, és kis ingadozásnál nem kényszerít teljes újrarajzolást. A témaváltás, zoom, resize és nyers/kalibrált mértékegységváltás frissíti a hátteret. Külön teszt bizonyítja, hogy az oszlopfrissítés nem vált ki teljes `draw_event` eseményt, és a mentett PNG-ben is megmaradnak az animált oszlopok.
+
+Az előző terhelésméréshez hasonló Ubuntu/Xvfb, 150%-os Tk, 1000 mintás puffer és 200 Hz célsebesség mellett, nézetenként 4 másodperc alatt (ebből 500 ms szándékos GUI-szünet):
+
+| Nézet | Elküldött / fogadott minták | Kirajzolt képkockák | Medián | 95. percentilis | Maximum | Első képkocka GUI-szünet után |
+|---|---|---|---|---|---|---|
+| Histogram, blitting | 757 / 757 | 75 | 6,5 ms | 9,0 ms | 152,4 ms | 7,3 ms |
+| Waterfall | 771 / 771 | 20 | 138,3 ms | 197,0 ms | 197,8 ms | 150,6 ms |
+
+A mérés most a közös képkocka-visszajelzést használja: gyors rajzolásnál a Tk-blit visszatérését, teljes rajzolásnál a Matplotlib rajzolási eseményét. A 152 ms-os maximum az első teljes rajzolást is tartalmazza. A korábbi teljes rajzolásos hisztogram 21 képkockája helyett 75 képkocka készült; az oszlopadatok továbbra is valódi, legfrissebb mérési minták, köztes értékek kitalálása nélkül. Ez nem a fizikai érzékelő vagy a monitor hardveres késleltetésének mérése.
+
 ## Indítás és megjelenítés
 
 - Tiszta Windows-másolatban, szóközt és ékezetet tartalmazó útvonalról, másik munkakönyvtárból létrejött a venv, települtek a függőségek, és a `--check-env` a helyi venv interpreterét jelentette.
@@ -46,4 +68,4 @@ Az idő a szintetikus sor elküldésétől a Matplotlib `draw_event` eseményéi
 
 ## A teszt határa
 
-Valódi AS7265x/Arduino eszközzel és USB-s soros adapterrel nem történt mérés. A kommunikációt szimulált porttal, Linux pszeudoterminállal és a beépített demóval ellenőriztük. A tényleges firmware baudját, csatornasorrendjét és az USB-eszköz Linux-jogosultságait a konkrét hardveren is ellenőrizni kell.
+Valódi AS7265x/Arduino Nano eszközzel és USB-s soros adapterrel nem történt mérés vagy feltöltés. A kommunikációt szimulált porttal, Linux pszeudoterminállal, a beépített demóval és a tényleges firmware-kódot futtató virtuális I²C-harness-szel ellenőriztük. A konkrét panelen még ellenőrizni kell a 3,3 V-os szintillesztést, a LED-ek tényleges bekötését/terhelhetőségét, a konverziós sebességet és a Nano bootloader-profilját.

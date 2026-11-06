@@ -21,6 +21,7 @@ import numpy as np
 from serial.tools import list_ports
 
 from gui_style import Theme, Collapsible, WheelGuard, Tooltip
+from plot_render import HistogramBlitter, nice_ceiling
 from spectral_core import Acquisition, SpectrumBuffer, WAVELENGTHS, MAX_SAMPLES, CONTROL_QUEUE_SIZE
 
 
@@ -53,6 +54,10 @@ class SpectralReader:
         self.last_render = 0.0
         self.last_received = 0
         self.last_plotted_received = 0
+        self.histogram_blitter = None
+        self.last_scale_change = 0.0
+        self.presented_frames = 0
+        self.presented_at = 0.0
         self.pending_log = deque(maxlen=100)
         self.mode = self.colorbar = self.bars = self.image = None
         self.view_limits = {}
@@ -68,6 +73,20 @@ class SpectralReader:
         self.status_var = tk.StringVar(value="Készen áll · válassz portot, vagy indíts demómérést.")
         self.count_var = tk.StringVar(value="0 / 50 minta")
         self.metric_var = tk.StringVar(value="18 csatorna  ·  410–940 nm")
+        self.device_available = False
+        self.device_state = None
+        self.pending_device = {}
+        self.measurement_format = "calibrated"
+        self.device_info_var = tk.StringVar(value="Panelvezérlés: az új Nano firmware szükséges.")
+        self.temperature_var = tk.StringVar(value="Hőmérséklet: — / — / — °C")
+        self.gain_var = tk.StringVar(value="16×")
+        self.cycles_var = tk.StringVar(value="10")
+        self.sensor_format_var = tk.StringVar(value="Kalibrált")
+        self.led_vars = [tk.BooleanVar(value=False) for _ in range(3)]
+        self.led_current_vars = [tk.StringVar(value="12.5 mA") for _ in range(3)]
+        self.indicator_vars = [tk.BooleanVar(value=False) for _ in range(3)]
+        self.indicator_current_vars = [tk.StringVar(value="1 mA") for _ in range(3)]
+        self.board_widgets = []
         self._menus()
         heading = ttk.Frame(master, padding=(p(18), p(14), p(18), p(10)))
         heading.pack(fill="x")
@@ -122,6 +141,7 @@ class SpectralReader:
         self.save_btn = ttk.Button(acquisition, text="Mentés CSV-be…", state="disabled",
                                    command=self.save_csv)
         self.save_btn.pack(fill="x", pady=p(3))
+        self._board_panel()
         view = self._section("Megjelenítés")
         self.display_mode_combo = self._field(view, "Diagram típusa", self.display_mode_var,
                                                values=("Histogram", "Waterfall"))
@@ -192,6 +212,7 @@ class SpectralReader:
         ttk.Label(status, textvariable=self.count_var, style="Status.TLabel", width=22,
                   anchor="e").pack(side="right")
         self.refresh_ports()
+        self._board_controls()
         self.apply_theme()
         self._log("Készen áll. 18 csatorna · 410–940 nm. A napló legfeljebb 2000 sort őriz.")
         self.timer = master.after(50, self._tick)
@@ -237,6 +258,156 @@ class SpectralReader:
         widget.pack(fill="x", pady=(0, p(4)))
         self.guard.watch(widget)
         return widget
+
+    def _board_panel(self):
+        p = self.theme.px
+        panel = self._section("Nano / szenzor vezérlése")
+        ttk.Label(panel, textvariable=self.device_info_var, style="Muted.TLabel",
+                  wraplength=p(235)).pack(fill="x", pady=(0, p(8)))
+        for index, name in enumerate(("Fehér · AS72651", "IR · AS72652", "UV · AS72653")):
+            row = ttk.Frame(panel, style="Panel.TFrame")
+            row.pack(fill="x", pady=p(3))
+            check = ttk.Checkbutton(row, text=name, variable=self.led_vars[index],
+                                    command=lambda i=index: self._send_led(i))
+            check.pack(side="left", fill="x", expand=True)
+            current = ttk.Combobox(row, textvariable=self.led_current_vars[index], width=8,
+                                    state="readonly", values=("12.5 mA", "25 mA", "50 mA", "100 mA"))
+            current.pack(side="right")
+            current.bind("<<ComboboxSelected>>", lambda event, i=index: self._send_led(i))
+            self.guard.watch(current)
+            self.board_widgets.extend((check, current))
+            check.device_command = current.device_command = "LED"
+        self.off_btn = ttk.Button(panel, text="Minden LED kikapcsolása", command=lambda: self._send_device("OFF"))
+        self.off_btn.pack(fill="x", pady=(p(6), p(10)))
+        self.gain_combo = self._field(panel, "Szenzor erősítése", self.gain_var,
+                                      values=("1×", "3.7×", "16×", "64×"))
+        self.cycles_entry = self._field(panel, "Integrációs ciklus / bank (1–256)", self.cycles_var, maximum=256)
+        self.sensor_format_combo = self._field(panel, "Szenzoradat típusa", self.sensor_format_var,
+                                               values=("Kalibrált", "Nyers"))
+        self.sensor_apply_btn = ttk.Button(panel, text="Mérési beállítások alkalmazása", command=self._apply_sensor)
+        self.sensor_apply_btn.pack(fill="x", pady=p(5))
+        ttk.Label(panel, text="18 csatorna: kb. 2 × ciklus × 2,8 ms + kiolvasás. Rövidebb idő: gyorsabb, zajosabb mérés.",
+                  style="Muted.TLabel", wraplength=p(235)).pack(fill="x", pady=(p(3), p(8)))
+        self.stream_btn = ttk.Button(panel, text="Adatküldés szüneteltetése", command=self._toggle_stream)
+        self.stream_btn.pack(fill="x", pady=p(3))
+        self.shot_btn = ttk.Button(panel, text="Egy mérés (szünetben)", command=lambda: self._send_device("SHOT"))
+        self.shot_btn.pack(fill="x", pady=p(3))
+        ttk.Label(panel, text="Jelző LED-ek (ha ki vannak építve)", style="Panel.TLabel").pack(anchor="w", pady=(p(10), p(3)))
+        for index, name in enumerate(("AS72651", "AS72652", "AS72653")):
+            row = ttk.Frame(panel, style="Panel.TFrame")
+            row.pack(fill="x", pady=p(3))
+            check = ttk.Checkbutton(row, text=name, variable=self.indicator_vars[index],
+                                    command=lambda i=index: self._send_led(i, indicator=True))
+            check.pack(side="left", fill="x", expand=True)
+            current = ttk.Combobox(row, textvariable=self.indicator_current_vars[index], width=8,
+                                    state="readonly", values=("1 mA", "2 mA", "4 mA", "8 mA"))
+            current.pack(side="right")
+            current.bind("<<ComboboxSelected>>", lambda event, i=index: self._send_led(i, indicator=True))
+            self.guard.watch(current)
+            self.board_widgets.extend((check, current))
+            check.device_command = current.device_command = "IND"
+        ttk.Label(panel, textvariable=self.temperature_var, style="Muted.TLabel", wraplength=p(235)).pack(fill="x", pady=p(8))
+        self.temp_btn = ttk.Button(panel, text="Hőmérsékletek / állapot lekérése", command=lambda: self._send_device("TEMP"))
+        self.temp_btn.pack(fill="x")
+        self.board_widgets.extend((self.gain_combo, self.cycles_entry, self.sensor_format_combo,
+                                   self.sensor_apply_btn, self.stream_btn, self.shot_btn, self.temp_btn))
+        self.stream_btn.device_command = "RUN"
+        self.shot_btn.device_command = "SHOT"
+        self.temp_btn.device_command = "TEMP"
+        self.sections[-1].toggle()
+
+    def _board_controls(self):
+        available = bool(self.device_available and self.worker and self.running and not self.closing)
+        busy = bool(self.pending_device)
+        caps = set(self.worker.protocol.hello["caps"]) if available and self.worker.protocol.hello else set()
+        for widget in self.board_widgets:
+            supported = getattr(widget, "device_command", "SET") in caps
+            state = "disabled" if not available or busy or not supported else ("readonly" if isinstance(widget, ttk.Combobox) else "normal")
+            widget.configure(state=state)
+        self.off_btn.configure(state="normal" if available and "OFF" in caps else "disabled")
+        if available and not busy and self.device_state and self.device_state["stream"]:
+            self.shot_btn.configure(state="disabled")
+
+    def _send_device(self, op, *args):
+        if not self.worker or not self.device_available or not self.running:
+            return
+        if op == "OFF" and "OFF" in self.pending_device.values():
+            return
+        try:
+            request = self.worker.command(op, *args)
+            self.pending_device[request] = op
+            self.device_info_var.set("Parancs elküldve · visszaigazolásra vár…")
+            self._board_controls()
+        except ValueError as exc:
+            self._device_event({"type": "error", "id": 0, "message": str(exc)})
+
+    def _send_led(self, index, indicator=False):
+        variables = self.indicator_vars if indicator else self.led_vars
+        currents = self.indicator_current_vars if indicator else self.led_current_vars
+        choices = ("1 mA", "2 mA", "4 mA", "8 mA") if indicator else ("12.5 mA", "25 mA", "50 mA", "100 mA")
+        self._send_device("IND" if indicator else "LED", index, int(variables[index].get()), choices.index(currents[index].get()))
+
+    def _apply_sensor(self):
+        try:
+            gain = ("1×", "3.7×", "16×", "64×").index(self.gain_var.get())
+            cycles = self._integer(self.cycles_var, 256, "Integrációs ciklus")
+            self._send_device("SET", gain, cycles, "raw" if self.sensor_format_var.get() == "Nyers" else "calibrated")
+        except ValueError as exc:
+            self.device_info_var.set(str(exc))
+
+    def _toggle_stream(self):
+        if self.device_state:
+            self._send_device("RUN", 0 if self.device_state["stream"] else 1)
+
+    def _device_event(self, message):
+        kind = message["type"]
+        request = message.get("id", 0)
+        acknowledged = self.pending_device.pop(request, None)
+        if kind == "pong":
+            return
+        if kind == "hello":
+            self.device_available = bool(message["sensor_ok"])
+            self.device_info_var.set("{} · firmware {}{}".format(message["board"], message["firmware"],
+                                     "" if self.device_available else " · szenzorhiba"))
+        elif kind == "state":
+            self.device_state = message
+            self.gain_var.set(("1×", "3.7×", "16×", "64×")[message["gain"]])
+            self.cycles_var.set(str(message["cycles"]))
+            self.sensor_format_var.set("Nyers" if message["format"] == "raw" else "Kalibrált")
+            self.measurement_format = message["format"]
+            for index in range(3):
+                self.led_vars[index].set(bool(message["led"][index]))
+                self.led_current_vars[index].set(("12.5 mA", "25 mA", "50 mA", "100 mA")[message["current"][index]])
+                self.indicator_vars[index].set(bool(message["indicator"][index]))
+                self.indicator_current_vars[index].set(("1 mA", "2 mA", "4 mA", "8 mA")[message["indicator_current"][index]])
+            self.stream_btn.configure(text="Adatküldés szüneteltetése" if message["stream"] else "Adatküldés folytatása")
+            if acknowledged:
+                self.device_info_var.set("Visszaigazolva · {}".format(acknowledged))
+            self.dirty = True
+            if not len(self.buffer):
+                self.save_btn.configure(state="disabled")
+        elif kind == "temperature":
+            self.temperature_var.set("51 / 52 / 53: {} / {} / {} °C".format(*message["values"]))
+            if acknowledged:
+                self.device_info_var.set("Hőmérsékletek visszaigazolva.")
+        elif kind in {"error", "timeout"}:
+            if self.device_state:
+                # Requested checkbox/input values are not evidence of an applied
+                # hardware setting. Restore the last confirmed values on failure.
+                confirmed = self.device_state
+                for index in range(3):
+                    self.led_vars[index].set(bool(confirmed["led"][index]))
+                    self.indicator_vars[index].set(bool(confirmed["indicator"][index]))
+                    self.led_current_vars[index].set(("12.5 mA", "25 mA", "50 mA", "100 mA")[confirmed["current"][index]])
+                    self.indicator_current_vars[index].set(("1 mA", "2 mA", "4 mA", "8 mA")[confirmed["indicator_current"][index]])
+                self.gain_var.set(("1×", "3.7×", "16×", "64×")[confirmed["gain"]])
+                self.cycles_var.set(str(confirmed["cycles"]))
+                self.sensor_format_var.set("Nyers" if confirmed["format"] == "raw" else "Kalibrált")
+            self.device_info_var.set("Panelhiba · " + message["message"])
+            self._log("Panel: " + message["message"])
+        elif kind == "cancelled":
+            self._log(message["message"])
+        self._board_controls()
 
     def _scroll_sidebar(self, direction):
         bounds = self.side_canvas.bbox("all")
@@ -299,6 +470,11 @@ class SpectralReader:
         self.events = queue.Queue(maxsize=CONTROL_QUEUE_SIZE)
         self.worker = Acquisition(self.events, port, baud, self.demo_var.get(), buffer=self.buffer)
         self.last_received = self.last_plotted_received = 0
+        self.device_available = False
+        self.device_state = None
+        self.pending_device.clear()
+        self.measurement_format = "calibrated"
+        self.device_info_var.set("Panel firmware keresése… Régi CSV-firmware is olvasható.")
         self.running = True
         self._controls(True)
         self.save_btn.configure(state="disabled")
@@ -306,6 +482,7 @@ class SpectralReader:
         self._log("Új mérés indul. Az előző mérés pufferét lecseréltük.")
         self.dirty = True
         self.worker.start()
+        self._board_controls()
         self.master.after_cancel(self.timer)
         self.timer = self.master.after(0, self._tick)
 
@@ -316,6 +493,11 @@ class SpectralReader:
             self.baud_combo.configure(state="readonly")
         self.start_btn.configure(state="disabled" if active else "normal")
         self.stop_btn.configure(state="normal" if active else "disabled")
+        if not active:
+            self.device_available = False
+            self.pending_device.clear()
+            self.device_info_var.set("Kapcsolat zárva · új csatlakozással vezérelhető.")
+        self._board_controls()
 
     def stop_measurement(self):
         if self.worker:
@@ -323,6 +505,7 @@ class SpectralReader:
             self.running = False
             self.status_var.set("Leállítás…")
             self.stop_btn.configure(state="disabled")
+            self._board_controls()
 
     def _log(self, message):
         self.pending_log.append(time.strftime("%H:%M:%S") + "  " + message.replace("\n", " ")[:400])
@@ -359,6 +542,8 @@ class SpectralReader:
             if kind == "ready":
                 self.status_var.set("Mérés folyamatban · " + payload)
                 self._log(payload)
+            elif kind == "device":
+                self._device_event(payload)
             elif kind == "error":
                 self.status_var.set("Kapcsolati hiba · részletek az adatnaplóban")
                 self._log("HIBA: " + payload)
@@ -372,8 +557,7 @@ class SpectralReader:
         # Read a fresh snapshot, never replay a queue of stale display samples.
         received = self.buffer.received
         if received != self.last_received:
-            if not self.last_received:
-                self.save_btn.configure(state="normal")
+            self.save_btn.configure(state="normal")
             self.last_received = received
             self.dirty = True
         if self.worker and not self.worker.is_alive() and self.events.empty():
@@ -391,18 +575,19 @@ class SpectralReader:
                 self._cancel_canvas_callbacks()
                 self.master.destroy()
                 return
-        elif self.dirty and time.monotonic() - self.last_render >= 0.05:
+        elif self.dirty and time.monotonic() - self.last_render >= 1 / 30:
             self.update_plot()
             self.last_render = time.monotonic()
             self.dirty = False
         self._flush_log()
-        self.timer = self.master.after(20 if self.worker else 150, self._tick)
+        self.timer = self.master.after(10 if self.worker else 150, self._tick)
 
     def _build_plot(self, mode):
         # Only a deliberate view change rebuilds axes/artists.
         if self.mode:
             self.view_limits[self.mode] = (self.ax.get_xlim(), self.ax.get_ylim())
         self.figure.clear()
+        self.histogram_blitter = None
         self.ax = self.figure.add_subplot(111)
         self.bars = self.image = self.colorbar = None
         self.mode = mode
@@ -410,8 +595,9 @@ class SpectralReader:
         self.ax.set_xlabel("Hullámhossz (nm)")
         if mode == "Histogram":
             self.bars = self.ax.bar(np.arange(18), np.zeros(18), width=0.72, zorder=3)
+            self.histogram_blitter = HistogramBlitter(self.canvas, self.ax, self.bars)
             self.ax.set_title("Élő spektrum", loc="left", fontsize=11, fontweight="bold")
-            self.ax.set_ylabel("Intenzitás")
+            self.ax.set_ylabel("ADC érték" if self.measurement_format == "raw" else "Kalibrált intenzitás")
             self.ax.grid(axis="y", alpha=0.4, zorder=0)
             self.ax.set_xlim(-0.7, 17.7)
         else:
@@ -444,6 +630,9 @@ class SpectralReader:
             self._build_plot(mode)
         values = snapshot.values
         if mode == "Histogram":
+            ylabel = "ADC érték" if self.measurement_format == "raw" else "Kalibrált intenzitás"
+            if self.ax.get_ylabel() != ylabel:
+                self.ax.set_ylabel(ylabel, color=self.theme.colors["axis_text"])
             title = ("Élő spektrum · legfrissebb minta" if average == 1 else
                      "Átlagolt spektrum · {} minta".format(min(average, snapshot.count)))
             if self.ax.get_title(loc="left") != title:
@@ -452,10 +641,19 @@ class SpectralReader:
             for bar, value in zip(self.bars, values):
                 bar.set_height(value)
             if self.autoscale_var.get():
-                low, high = min(0, float(values.min())), max(1, float(values.max()))
-                margin = (high - low) * 0.08
-                self.ax.set_ylim(low - margin if low < 0 else 0, high + margin)
+                low = -nice_ceiling(max(0, -float(values.min())) * 1.1)
+                high = nice_ceiling(max(1, float(values.max())) * 1.1)
+                old_low, old_high = self.ax.get_ylim()
+                now = time.monotonic()
+                expand = low < old_low or high > old_high
+                shrink = high - low < (old_high - old_low) * 0.55
+                if expand or (shrink and now - self.last_scale_change > 1.0):
+                    self.ax.set_ylim(low, high)
+                    self.last_scale_change = now
         else:
+            ylabel = "ADC érték" if self.measurement_format == "raw" else "Kalibrált intenzitás"
+            if self.colorbar.ax.get_ylabel() != ylabel:
+                self.colorbar.set_label(ylabel, color=self.theme.colors["axis_text"])
             data = snapshot.history if snapshot.count else np.zeros((1, 18))
             self.image.set_data(data)
             old_limits = self.ax.get_xlim(), self.ax.get_ylim()
@@ -476,7 +674,11 @@ class SpectralReader:
         else:
             self.metric_var.set("18 csatorna  ·  410–940 nm  ·  még nincs adat")
         self.last_plotted_received = snapshot.received
-        self.canvas.draw_idle()
+        if self.histogram_blitter is not None:
+            if self.histogram_blitter.draw():
+                self._frame_presented()
+        else:
+            self.canvas.draw_idle()
 
     def _plot_colors(self):
         c = self.theme.colors
@@ -500,6 +702,8 @@ class SpectralReader:
         self.canvas.get_tk_widget().configure(background=c["panel"])
 
     def apply_theme(self):
+        if self.histogram_blitter is not None:
+            self.histogram_blitter.invalidate()
         self.theme.apply(self.theme_var.get())
         c = self.theme.colors
         self.toolbar.configure(background=c["panel"])
@@ -527,9 +731,18 @@ class SpectralReader:
             self.autoscale_var.set(False)
 
     def _draw_finished(self, event):
-        # Limit redraws from actual paint completion, including slow/high-DPI
-        # renderers; acquisition still advances independently between frames.
+        if event.canvas is not self.canvas or self.canvas.is_saving():
+            if self.histogram_blitter is not None:
+                self.histogram_blitter.invalidate()
+            return
+        if self.histogram_blitter is not None:
+            self.histogram_blitter.capture()
+        self._frame_presented()
+
+    def _frame_presented(self):
         self.last_render = time.monotonic()
+        self.presented_at = self.last_render
+        self.presented_frames += 1
 
     def reset_view(self):
         self.autoscale_var.set(True)
@@ -578,6 +791,9 @@ class SpectralReader:
                          "a legfrissebb mintát mutatja; az átlagolás külön állítható (1 = élő). "
                          "Nagyobb átlagolási ablak lassítja a változások követését. "
                          "Új mérés új puffert kezd.\n\n"
+                         "Panelvezérlés: a firmware/AS7265xController programot előbb töltsd a Nanóra. "
+                         "Bekötés: SDA=A4, SCL=A5. A Nano / szenzor vezérlése szekcióban a LED-ek, "
+                         "áramok, erősítés, integráció és hőmérsékletek érhetők el.\n\n"
                          "Nagyítás / eltolás után az automatikus skálázás kikapcsol. "
                          "A Nézet alaphelyzetbe gomb visszaállítja.\n\nPython: " + sys.executable +
                          "\nVenv: " + sys.prefix)
