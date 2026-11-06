@@ -2,6 +2,7 @@
 import time
 import tkinter as tk
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from mySpectRead02 import SpectralReader
@@ -70,6 +71,7 @@ class GuiTests(unittest.TestCase):
         dialog.destroy()
 
     def test_plot_reuses_artists_and_waterfall_oldest_is_top(self):
+        self.app.average_count_var.set("3")
         for value in (2, 4, 8):
             self.app.buffer.append(np.full(18, float(value)))
         self.app.update_plot()
@@ -86,6 +88,42 @@ class GuiTests(unittest.TestCase):
         self.app.update_plot()
         self.assertIs(image, self.app.image)
         self.assertEqual(len(self.app.figure.axes), 2)
+
+    def test_all_channels_follow_latest_sample_without_waiting_for_history(self):
+        self.app.sample_count_var.set("1000")
+        for _ in range(999):
+            self.app.buffer.append(np.full(18, 1000.0))
+        latest = np.arange(18, dtype=float)
+        self.app.buffer.append(latest)
+        self.app.update_plot()
+        np.testing.assert_array_equal([bar.get_height() for bar in self.app.bars], latest)
+        self.assertEqual(len(self.app.buffer), 1000)
+        self.assertIn("legfrissebb minta", self.app.ax.get_title(loc="left"))
+        self.app.average_count_var.set("2")
+        self.app.update_plot()
+        np.testing.assert_allclose([bar.get_height() for bar in self.app.bars], (1000 + latest) / 2)
+
+    def test_first_frame_after_gui_pause_uses_latest_received_sample(self):
+        self.app.demo_var.set(True)
+        self.app.start_measurement()
+        # Deliberately do not run Tk while acquisition keeps receiving samples.
+        time.sleep(0.35)
+        worker = self.app.worker
+        self.assertGreaterEqual(self.app.buffer.received, 3)
+        worker.stop_event.set()
+        worker.join(1)
+        expected = self.app.buffer.snapshot()
+        rendered = []
+        connection = self.app.canvas.mpl_connect("draw_event", lambda event: rendered.append(
+            (time.monotonic(), self.app.last_plotted_received,
+             [bar.get_height() for bar in self.app.bars])))
+        resumed = time.monotonic()
+        self.pump(0.4)
+        self.app.canvas.mpl_disconnect(connection)
+        self.assertTrue(rendered)
+        self.assertEqual(rendered[0][1], expected.received)
+        np.testing.assert_array_equal(rendered[0][2], expected.values)
+        self.assertLess(rendered[0][0] - resumed, 1.0)
 
     def test_scaled_bitmap_matches_available_canvas(self):
         widget = self.app.canvas.get_tk_widget()

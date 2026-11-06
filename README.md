@@ -1,6 +1,6 @@
 # AS7265x spektrális adatgyűjtő
 
-Tkinter / Matplotlib alkalmazás az AS7265x 18 csatornás soros mérési adatainak megjelenítésére Windows és Linux alatt. Világos és Fekete téma, átlagolt hisztogram, waterfall, méretezhető adatnapló és CSV-export.
+Tkinter / Matplotlib alkalmazás az AS7265x 18 csatornás soros mérési adatainak megjelenítésére Windows és Linux alatt. Világos és Fekete téma, élő vagy átlagolt hisztogram, waterfall, méretezhető adatnapló és CSV-export.
 
 ## Indítás
 
@@ -32,8 +32,11 @@ Windows alatt `.venv`, Linux alatt `.venv-linux` készül. Így közös Windows/
 1. Frissítsd a portlistát, és válassz portot. Kézzel is beírható például `COM3`, `/dev/ttyUSB0`, `/dev/ttyACM0` vagy egy `/dev/serial/by-id/…` útvonal.
 2. Állítsd be a firmware-rel egyező baudot (alapérték: 115200) és a puffer méretét (1–10000 minta).
 3. Indíts mérést. A **demó** szimulált adatot használ, eszköz nélkül.
-4. Válaszd a Histogram vagy Waterfall nézetet a Megjelenítés szekcióban. A waterfall magassága 1–2000 sor, de legfeljebb a pufferben őrzött minták látszanak. A legrégebbi sor felül, a legújabb alul jelenik meg.
-5. A CSV az utolsó N minta eredeti értékeit menti; leállítás után is elérhető. **Új mérés új puffert kezd**, ezért a megőrzendő adatot előbb mentsd el. A hisztogram a puffer átlagát mutatja.
+4. Válaszd a Histogram vagy Waterfall nézetet a Megjelenítés szekcióban. A hisztogram alapból **a legfrissebb teljes mintát mutatja mind a 18 csatornán**. Az **Átlagolás (minta, 1 = élő)** külön állítható: 1 az azonnali élő nézet, nagyobb érték az utolsó ennyi elérhető minta átlaga. Az előzménypuffer mérete önmagában nem lassítja a hisztogramot.
+5. A waterfall magassága 1–2000 sor, de legfeljebb a pufferben őrzött minták látszanak. A legrégebbi sor felül, a legújabb alul jelenik meg. Az átlagolás a hisztogramra vonatkozik; a waterfall az eredeti mintákat mutatja.
+6. A CSV az utolsó N minta eredeti értékeit menti; leállítás után is elérhető. **Új mérés új puffert kezd**, ezért a megőrzendő adatot előbb mentsd el.
+
+Nagy átlagolási ablak tudatosan lassítja a változások követését. Például 50 minta és 2 Hz-es mérés esetén a teljes ablak cserélődése körülbelül 25 másodperc. Gyors visszajelzéshez hagyd az átlagolást 1-en; a CSV előzménypuffere ettől továbbra is lehet nagy.
 
 A firmware soronként 18 vesszővel elválasztott számot küldjön, LF vagy CRLF lezárással. A sor végén egy záró vessző megengedett. A csatornák sorrendje:
 
@@ -53,7 +56,8 @@ A `test01.py PORT BAUD` egy egyszerű, szintén automatikus venv-indítású kon
 - Az oldalsáv szekciói összecsukhatók; a diagram és a napló közötti elválasztó húzható. Kis ablakban az oldalsáv görgethető.
 - A számmező és a legördülő csak tényleges kattintás és megtartott fókusz után módosítható görgővel; egyébként az oldalsáv gördül.
 - A diagram eszköztárával nagyíthatsz és eltolhatsz. Kézi navigáció után kikapcsol az automatikus skálázás. A **Nézet alaphelyzetbe** visszakapcsolja.
-- A soros olvasó külön szálon fut, 0,2 s olvasási időtúllépéssel, 512 elemű eseménysorral. A GUI korlátozott adagokat dolgoz fel, legfeljebb 10 Hz-es adatfüggő diagramfrissítéssel. A minták megőrzését a beállított puffer korlátozza, a rajzolás összevonása nem dob el feldolgozott mintákat.
+- A soros olvasó külön szálon fut, 0,05 s olvasási időtúllépéssel. A teljes minták közvetlenül a szálbiztos, korlátozott előzménypufferbe kerülnek; a GUI annak friss pillanatképét rajzolja, legfeljebb 20 Hz gyakorisággal. A tényleges rajzolás befejezése is beleszámít az ütemezésbe. Egy megakasztott GUI vagy nyitott fájlablak után nem kell régi mérési eseményeket végigjátszani.
+- A kapcsolati üzeneteknek külön, 64 elemű sora van. Túl sok diagnosztikai sor esetén ezek összevonódnak; a napló telítődése nem állítja meg az érvényes mérések fogadását. A rajzolás köztes képkockákat kihagyhat, az eredeti méréseket a beállított pufferhatárig őrzi.
 - A napló legfeljebb 2000 sort őriz. A nagy adatsebesség nem jelent korlátlan veszteségmentes rögzítést: a soros eszköz és az operációs rendszer bemeneti puffere is véges. Tartós, teljes mérési archívumhoz külön folyamatos fájlírás szükséges.
 
 Az aktuális újrahasználható specifikáció: [ablakstilus-prompt_v02.md](ablakstilus-prompt_v02.md). Az eredeti [v01](ablakstilus-prompt_v01.md) megmaradt. A Tk/ttk a prompt palettáját, lapos kereteit és platformon elérhető betűtípusát alkalmazza; a pixelpontos sarokkerekítés helyett natív ttk-vezérlőket használ.
@@ -71,6 +75,6 @@ Az aktuális újrahasználható specifikáció: [ablakstilus-prompt_v02.md](abla
 xvfb-run -a .venv-linux/bin/python -m unittest discover -s tests -v
 ```
 
-A tesztek ellenőrzik a parser hibakezelését, a részleges és túl hosszú sorok feldolgozását, a puffer átlagát és sorrendjét, a CSV-t, a megszakítható háttérszálat, a GUI témaváltását és állapotmegőrzését, a görgővédelmet és az ismételt indítást. Linuxon valódi pszeudoterminálon keresztül is vizsgálják a pyserial adatfogadását. A GitHub Actions Windows és Linux rendszeren futtatja ugyanezeket.
+A tesztek ellenőrzik a parser hibakezelését, a részleges és túl hosszú sorok feldolgozását, a puffer átlagát és sorrendjét, a CSV-t, a megszakítható háttérszálat, a GUI témaváltását és állapotmegőrzését, a görgővédelmet és az ismételt indítást. Külön regressziós teszt ellenőrzi mind a 18 csatorna azonnali lépcsőválaszát, az előzménytől független átlagolást, a GUI megállása utáni első képkocka frissességét, valamint 5000 spektrum fogadását telt GUI-eseménysor és 2000 diagnosztikai sor mellett. Linuxon valódi pszeudoterminálon keresztül is vizsgálják a pyserial adatfogadását. A GitHub Actions Windows és Linux rendszeren futtatja ugyanezeket.
 
 A ténylegesen lefuttatott helyi ellenőrzések és a hardveres teszt határai: [CHECKS.md](CHECKS.md).

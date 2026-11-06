@@ -21,7 +21,7 @@ import numpy as np
 from serial.tools import list_ports
 
 from gui_style import Theme, Collapsible, WheelGuard, Tooltip
-from spectral_core import Acquisition, SpectrumBuffer, WAVELENGTHS, MAX_SAMPLES
+from spectral_core import Acquisition, SpectrumBuffer, WAVELENGTHS, MAX_SAMPLES, CONTROL_QUEUE_SIZE
 
 
 class SpectralCanvas(FigureCanvasTkAgg):
@@ -45,12 +45,14 @@ class SpectralReader:
         master.minsize(min(p(820), master.winfo_screenwidth() - 60),
                        min(p(560), master.winfo_screenheight() - 90))
         master.protocol("WM_DELETE_WINDOW", self.close)
-        self.events = queue.Queue(maxsize=512)
+        self.events = queue.Queue(maxsize=CONTROL_QUEUE_SIZE)
         self.buffer = SpectrumBuffer()
         self.worker = None
         self.running = self.closing = False
         self.dirty = True
         self.last_render = 0.0
+        self.last_received = 0
+        self.last_plotted_received = 0
         self.pending_log = deque(maxlen=100)
         self.mode = self.colorbar = self.bars = self.image = None
         self.view_limits = {}
@@ -58,6 +60,7 @@ class SpectralReader:
         self.baud_var = tk.StringVar(value="115200")
         self.sample_count_var = tk.StringVar(value="50")
         self.waterfall_rows_var = tk.StringVar(value="50")
+        self.average_count_var = tk.StringVar(value="1")
         self.display_mode_var = tk.StringVar(value="Histogram")
         self.demo_var = tk.BooleanVar(value=demo)
         self.theme_var = tk.StringVar(value="Világos")
@@ -108,7 +111,7 @@ class SpectralReader:
         acquisition = self._section("Adatgyűjtés")
         self.sample_entry = self._field(acquisition, "Puffer mérete (minta)", self.sample_count_var,
                                          maximum=MAX_SAMPLES)
-        ttk.Label(acquisition, text="Az átlag és a CSV az utolsó N mintát tartalmazza.",
+        ttk.Label(acquisition, text="A CSV és a waterfall az utolsó N mintát őrzi. Az élő nézet ettől független.",
                   style="Muted.TLabel", wraplength=p(235)).pack(fill="x", pady=(p(5), p(8)))
         self.start_btn = ttk.Button(acquisition, text="Mérés indítása", style="Primary.TButton",
                                     command=self.start_measurement)
@@ -122,12 +125,15 @@ class SpectralReader:
         view = self._section("Megjelenítés")
         self.display_mode_combo = self._field(view, "Diagram típusa", self.display_mode_var,
                                                values=("Histogram", "Waterfall"))
+        self.average_entry = self._field(view, "Átlagolás (minta, 1 = élő)", self.average_count_var,
+                                          maximum=MAX_SAMPLES)
         self.waterfall_rows_entry = self._field(view, "Waterfall magassága (sor)",
                                                  self.waterfall_rows_var, maximum=2000)
         ttk.Checkbutton(view, text="Automatikus tengelyhatárok", variable=self.autoscale_var,
                         command=self._settings_changed).pack(anchor="w", pady=(p(10), p(5)))
         ttk.Button(view, text="Nézet alaphelyzetbe", command=self.reset_view).pack(fill="x")
-        for variable in (self.sample_count_var, self.waterfall_rows_var, self.display_mode_var):
+        for variable in (self.sample_count_var, self.waterfall_rows_var, self.display_mode_var,
+                         self.average_count_var):
             variable.trace_add("write", self._settings_changed)
         workspace = ttk.Frame(content)
         workspace.grid(row=0, column=1, sticky="nsew")
@@ -157,6 +163,7 @@ class SpectralReader:
         self.tooltips = [Tooltip(button, self.theme, tips.get(name, name))
                          for name, button in self.toolbar._buttons.items()]
         self.canvas.mpl_connect("button_release_event", self._navigation_finished)
+        self.canvas.mpl_connect("draw_event", self._draw_finished)
         self.panes.add(chart, minsize=p(260), stretch="always")
         log_panel = ttk.Frame(self.panes, style="Panel.TFrame", padding=p(8))
         log_header = ttk.Frame(log_panel, style="Panel.TFrame")
@@ -278,6 +285,7 @@ class SpectralReader:
         try:
             capacity = self._integer(self.sample_count_var, MAX_SAMPLES, "Puffer")
             self._integer(self.waterfall_rows_var, 2000, "Waterfall")
+            self._integer(self.average_count_var, MAX_SAMPLES, "Átlagolás")
             baud = int(self.baud_var.get())
             if baud <= 0:
                 raise ValueError("Az átviteli sebesség pozitív egész szám legyen.")
@@ -288,8 +296,9 @@ class SpectralReader:
             self.show_dialog("Beállítási hiba", str(exc))
             return
         self.buffer = SpectrumBuffer(capacity)
-        self.events = queue.Queue(maxsize=512)
-        self.worker = Acquisition(self.events, port, baud, self.demo_var.get())
+        self.events = queue.Queue(maxsize=CONTROL_QUEUE_SIZE)
+        self.worker = Acquisition(self.events, port, baud, self.demo_var.get(), buffer=self.buffer)
+        self.last_received = self.last_plotted_received = 0
         self.running = True
         self._controls(True)
         self.save_btn.configure(state="disabled")
@@ -297,6 +306,8 @@ class SpectralReader:
         self._log("Új mérés indul. Az előző mérés pufferét lecseréltük.")
         self.dirty = True
         self.worker.start()
+        self.master.after_cancel(self.timer)
+        self.timer = self.master.after(0, self._tick)
 
     def _controls(self, active):
         for widget in (self.port_combo, self.baud_combo, self.demo_check, self.refresh_btn):
@@ -339,17 +350,13 @@ class SpectralReader:
     def _tick(self):
         started = time.monotonic()
         count = 0
-        while count < 200 and time.monotonic() - started < 0.008:
+        while count < 16 and time.monotonic() - started < 0.004:
             try:
                 kind, payload = self.events.get_nowait()
             except queue.Empty:
                 break
             count += 1
-            if kind == "sample":
-                self.buffer.append(payload)
-                self.dirty = True
-                self.save_btn.configure(state="normal")
-            elif kind == "ready":
+            if kind == "ready":
                 self.status_var.set("Mérés folyamatban · " + payload)
                 self._log(payload)
             elif kind == "error":
@@ -361,7 +368,18 @@ class SpectralReader:
                                      "és hogy más program nem használja-e.")
             else:
                 self._log("Kihagyott / szöveges sor: " + payload)
+        # Sampling continues in the worker while Tk is drawing or a dialog is open.
+        # Read a fresh snapshot, never replay a queue of stale display samples.
+        received = self.buffer.received
+        if received != self.last_received:
+            if not self.last_received:
+                self.save_btn.configure(state="normal")
+            self.last_received = received
+            self.dirty = True
         if self.worker and not self.worker.is_alive() and self.events.empty():
+            if self.worker.suppressed_messages:
+                self._log("Összevont diagnosztika: {} további szöveges / hibás sor kihagyva."
+                          .format(self.worker.suppressed_messages))
             self.worker = None
             self.running = False
             self._controls(False)
@@ -373,12 +391,12 @@ class SpectralReader:
                 self._cancel_canvas_callbacks()
                 self.master.destroy()
                 return
-        elif self.dirty and time.monotonic() - self.last_render >= 0.1:
+        elif self.dirty and time.monotonic() - self.last_render >= 0.05:
             self.update_plot()
             self.last_render = time.monotonic()
             self.dirty = False
         self._flush_log()
-        self.timer = self.master.after(50 if self.worker else 150, self._tick)
+        self.timer = self.master.after(20 if self.worker else 150, self._tick)
 
     def _build_plot(self, mode):
         # Only a deliberate view change rebuilds axes/artists.
@@ -392,7 +410,7 @@ class SpectralReader:
         self.ax.set_xlabel("Hullámhossz (nm)")
         if mode == "Histogram":
             self.bars = self.ax.bar(np.arange(18), np.zeros(18), width=0.72, zorder=3)
-            self.ax.set_title("Átlagolt spektrum", loc="left", fontsize=11, fontweight="bold")
+            self.ax.set_title("Élő spektrum", loc="left", fontsize=11, fontweight="bold")
             self.ax.set_ylabel("Intenzitás")
             self.ax.grid(axis="y", alpha=0.4, zorder=0)
             self.ax.set_xlim(-0.7, 17.7)
@@ -413,10 +431,24 @@ class SpectralReader:
 
     def update_plot(self):
         mode = self.display_mode_var.get()
+        try:
+            average = self._integer(self.average_count_var, MAX_SAMPLES, "Átlagolás")
+        except ValueError:
+            average = 1
+        try:
+            rows = self._integer(self.waterfall_rows_var, 2000, "Waterfall")
+        except ValueError:
+            rows = 50
+        snapshot = self.buffer.snapshot(average=average, rows=rows if mode == "Waterfall" else 0)
         if mode != self.mode:
             self._build_plot(mode)
+        values = snapshot.values
         if mode == "Histogram":
-            values = self.buffer.mean()
+            title = ("Élő spektrum · legfrissebb minta" if average == 1 else
+                     "Átlagolt spektrum · {} minta".format(min(average, snapshot.count)))
+            if self.ax.get_title(loc="left") != title:
+                self.ax.set_title(title, loc="left", fontsize=11, fontweight="bold",
+                                  color=self.theme.colors["text"])
             for bar, value in zip(self.bars, values):
                 bar.set_height(value)
             if self.autoscale_var.get():
@@ -424,11 +456,7 @@ class SpectralReader:
                 margin = (high - low) * 0.08
                 self.ax.set_ylim(low - margin if low < 0 else 0, high + margin)
         else:
-            try:
-                rows = self._integer(self.waterfall_rows_var, 2000, "Waterfall")
-            except ValueError:
-                rows = 50
-            data = self.buffer.recent(rows) if len(self.buffer) else np.zeros((1, 18))
+            data = snapshot.history if snapshot.count else np.zeros((1, 18))
             self.image.set_data(data)
             old_limits = self.ax.get_xlim(), self.ax.get_ylim()
             self.image.set_extent((-0.5, 17.5, len(data) - 0.5, -0.5))
@@ -440,14 +468,14 @@ class SpectralReader:
             else:
                 self.ax.set_xlim(old_limits[0])
                 self.ax.set_ylim(old_limits[1])
-        self.count_var.set("{} / {} minta".format(len(self.buffer), self.buffer.capacity))
-        if len(self.buffer):
-            values = self.buffer.mean()
+        self.count_var.set("{} / {} minta".format(snapshot.count, snapshot.capacity))
+        if snapshot.count:
             index = int(np.argmax(values))
-            self.metric_var.set("Csúcs: {} nm · {:.1f}  |  összesen {} minta".format(
-                WAVELENGTHS[index], values[index], self.buffer.received))
+            self.metric_var.set("Csúcs: {} nm · {:.1f}  |  {} minta".format(
+                WAVELENGTHS[index], values[index], snapshot.received))
         else:
             self.metric_var.set("18 csatorna  ·  410–940 nm  ·  még nincs adat")
+        self.last_plotted_received = snapshot.received
         self.canvas.draw_idle()
 
     def _plot_colors(self):
@@ -498,6 +526,11 @@ class SpectralReader:
         if self.toolbar.mode:
             self.autoscale_var.set(False)
 
+    def _draw_finished(self, event):
+        # Limit redraws from actual paint completion, including slow/high-DPI
+        # renderers; acquisition still advances independently between frames.
+        self.last_render = time.monotonic()
+
     def reset_view(self):
         self.autoscale_var.set(True)
         self.ax.set_xlim(-0.7, 17.7)
@@ -540,8 +573,11 @@ class SpectralReader:
         self.show_dialog("Használat és rendszer",
                          "Válassz portot (Windows: COM3; Linux: /dev/ttyUSB0 vagy /dev/ttyACM0), "
                          "majd indíts mérést. A demóhoz nem kell eszköz.\n\n"
-                         "A bemenet soronként 18, vesszővel elválasztott érték. Az átlag és a CSV "
-                         "az utolsó N mintát tartalmazza. Új mérés új puffert kezd.\n\n"
+                         "A bemenet soronként 18, vesszővel elválasztott érték. "
+                         "A CSV és a waterfall az utolsó N mintát tartalmazza. A hisztogram alapból "
+                         "a legfrissebb mintát mutatja; az átlagolás külön állítható (1 = élő). "
+                         "Nagyobb átlagolási ablak lassítja a változások követését. "
+                         "Új mérés új puffert kezd.\n\n"
                          "Nagyítás / eltolás után az automatikus skálázás kikapcsol. "
                          "A Nézet alaphelyzetbe gomb visszaállítja.\n\nPython: " + sys.executable +
                          "\nVenv: " + sys.prefix)
