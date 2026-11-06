@@ -32,12 +32,14 @@ def ensure_venv():
                     "Nem hozható létre a venv. Linuxon telepítsd a python3-venv "
                     "csomagot, és ellenőrizd a projekt írási jogát. {}".format(exc)
                 ) from exc
-        probe = subprocess.run([str(python), "-c", "import sys; print(sys.prefix)"],
-                               capture_output=True, text=True)
+        probe = subprocess.run(
+            [str(python), "-X", "utf8", "-c",
+             "import sys; sys.stdout.reconfigure(encoding='utf-8'); print(sys.prefix)"],
+            capture_output=True, text=True, encoding="utf-8")
         if probe.returncode or Path(probe.stdout.strip()).absolute() != VENV.absolute():
             raise RuntimeError("A meglévő venv nem használható: {}. Nevezd át, majd indítsd újra."
                                .format(VENV))
-        command = [str(python), str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
+        command = [str(python), "-X", "utf8", str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
         if os.name != "nt":
             os.execv(str(python), command)
         try:
@@ -50,11 +52,11 @@ def ensure_venv():
                             str(sys.version_info[:2]).encode("ascii")).hexdigest()
     marker = VENV / ".spectread-requirements.sha256"
     installed = marker.read_text().strip() if marker.exists() else ""
-    probe = subprocess.run([sys.executable, "-c", "import serial, numpy, matplotlib"],
+    probe = subprocess.run([sys.executable, "-X", "utf8", "-c", "import serial, numpy, matplotlib"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if installed != digest or probe.returncode:
         print("Függőségek ellenőrzése / telepítése a venv-be…", flush=True)
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", str(requirements)])
+        subprocess.check_call([sys.executable, "-X", "utf8", "-m", "pip", "install", "-r", str(requirements)])
         marker.write_text(digest, encoding="ascii")
     try:
         import tkinter  # noqa: F401 -- provided by the OS, not pip
@@ -66,6 +68,11 @@ def ensure_venv():
 
 
 def bootstrap_or_exit():
+    # Redirected Windows consoles may use cp1252, which cannot encode Hungarian
+    # text. Configure this process too, before its first startup/error message.
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     try:
         ensure_venv()
     except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
